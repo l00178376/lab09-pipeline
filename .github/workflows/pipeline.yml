@@ -1,9 +1,8 @@
-
 name: monthly-pipeline
 on:
   push:
   schedule:
-    - cron: "0 6 2 * *"
+    - cron: "30 5 3 * *"
   workflow_dispatch:
     inputs:
       month:
@@ -31,10 +30,13 @@ jobs:
       - uses: quarto-dev/quarto-actions/setup@v2
 
       - name: Run the pipeline
-        run: Rscript -e "targets::tar_make()"
+        run: |
+          Rscript -e "targets::tar_make()"
+          echo "Checking generated output files:"
+          ls -lah outputs/ || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: pipeline-outputs
-          path: outputs/```
+          path: outputs/
