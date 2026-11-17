@@ -1,0 +1,65 @@
+---
+title: "Monthly sales report"
+subtitle: "Online Retail II | ANALIT802 Lab 09"
+format:
+  html:
+    embed-resources: true
+params:
+  month: "2011-11"
+---
+
+```{r}
+#| label: setup
+#| include: false
+# Read the pipeline's results. tar_read() makes each target a dependency of
+# this report, so the report re-renders when any of them changes.
+library(targets)
+library(tidyverse)
+
+# The pipeline's data store, found from the project root, so this also works
+# when the chunks are run from reports/ (Render button, Run All)
+store <- here::here("_targets")
+if (!dir.exists(store)) {
+  stop("No pipeline results yet: run targets::tar_make() in the project folder first.",
+       call. = FALSE)
+}
+kpis <- tar_read(kpis, store = store)
+top_products <- tar_read(top_products, store = store)
+top_countries <- tar_read(top_countries, store = store)
+
+# Guard: the figures must be for the month this report is labelled with
+stopifnot(kpis$month == params$month)
+
+# Format money with a pound sign and thousands separators
+gbp <- function(x) paste0("£", format(round(x), big.mark = ",", trim = TRUE))
+```
+
+## Sales in `r params$month`
+
+Completed product sales came to `r gbp(kpis$revenue)` from
+`r format(kpis$orders, big.mark = ",")` orders placed by
+`r format(kpis$customers, big.mark = ",")` identified customers.
+The average order was worth `r gbp(kpis$avg_order_value)`.
+
+### Top five products by revenue
+
+```{r}
+#| echo: false
+# Top products for the month, revenue rounded to whole pounds
+top_products |>
+  mutate(revenue = gbp(revenue)) |>
+  knitr::kable(col.names = c("Product", "Revenue"))
+```
+
+### Top five countries by revenue
+
+```{r}
+#| echo: false
+# Top countries for the month
+top_countries |>
+  mutate(revenue = gbp(revenue)) |>
+  knitr::kable(col.names = c("Country", "Revenue"))
+```
+
+Source: monthly extract of the UCI Online Retail II dataset. Completed sales
+exclude cancellations, stock adjustments and non-product codes.

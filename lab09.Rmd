@@ -1,0 +1,394 @@
+---
+title: "Lab 09: Designing and Automating an Analytics Pipeline"
+subtitle: "Dependency graphs, validation and scheduling | ANALIT802"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 2
+editor_options:
+  chunk_output_type: inline
+---
+
+# Lab 09: Designing and Automating an Analytics Pipeline
+
+## Introduction
+
+In this lab, you convert a monthly sales analysis into an analytics pipeline. You first run the analysis as a single script. You then rebuild it as a pipeline with the `targets` package, add a stage that validates each monthly file and schedule the pipeline with GitHub Actions. The lab introduces these elements on one month of data. Portfolio Entry 3 applies them to a larger and less familiar dataset.
+
+The data are monthly extracts of the Online Retail II dataset, which was used in earlier labs. Each file contains the invoice lines for one month.
+
+**Learning outcomes.** This lab addresses module learning outcome 2: *devise sophisticated data analytics workflows to derive insights and value from datasets*. On completing the lab, you should be able to:
+
+1.  Distinguish an analytics pipeline from a data pipeline.
+2.  Devise an analytics pipeline as idempotent stages with declared inputs and outputs.
+3.  Justify a dependency graph over a script that re-runs every step.
+4.  Devise a validation stage with blocking and non-blocking rules.
+5.  Devise the scheduling and monitoring of a pipeline, including the detection of silent failure.
+
+The heading of each part states the outcomes it addresses.
+
+### Working method
+
+Complete the parts in order, because each part builds on the previous one. Most code is written in project files (`run_all.R`, `_targets.R` and `R/functions.R`), and the notebook cells are used to run and test those files. Write answers to the discussion questions in the spaces provided. Part 3 also requires a short decision record.
+
+## Setup
+
+1.  Download `lab09-pipeline.zip` and `Lab09_student_files.zip` from the module page. Extract the project and open `lab09-pipeline.Rproj`. This notebook, `lab09.Rmd`, is in the project folder.
+2.  Copy the three `retail_2011_*.csv` files into `data/raw/` and the three `bad_*.csv` files into `data/incoming/`.
+3.  In the Console, install any of the following packages that are not already installed: `install.packages(c("targets", "tarchetypes", "pointblank", "visNetwork", "here", "renv", "usethis", "gitcreds"))`.
+
+The project already contains two components:
+
+- `R/functions.R`, which defines one function for each stage and is adapted from the code written in Labs 03 and 08.
+- `reports/monthly_report.qmd`, a parameterised report that reads the results produced by the pipeline.
+
+```{r setup}
+# Load the packages used in the notebook
+library(tidyverse)
+library(targets)
+
+# The notebook runs in the project folder, so these paths are relative to it
+list.files("data/raw")
+list.files("data/incoming")
+
+# Load the stage functions to inspect and test them
+source("R/functions.R")
+```
+
+## Part 0. A Driver Script (outcomes 1–3)
+
+The simplest form of pipeline is a single script that calls each stage in order. The stages are defined in `R/functions.R`:
+
+- **Get:** `read_extract()` reads the monthly extract.
+- **Check:** `validate_extract()` validates the extract. It returns the data unchanged until Part 3.
+- **Prepare:** `clean_sales()` retains completed product sales.
+- **Analyse:** `summarise_month()` and `top_by()` compute the monthly figures.
+
+A script can read arguments supplied after its name on the command line by means of `commandArgs()`:
+
+```{r example-args, eval = FALSE}
+# In a script run as: Rscript run_all.R 2011-10
+args <- commandArgs(trailingOnly = TRUE)        # character vector: "2011-10"
+month <- if (length(args) > 0) args[1] else "2011-11"   # default if none given
+```
+
+### Exercise 1 - Driver script and stage table
+
+1.  Create `run_all.R` in the project folder. The script should take the month as an argument (default `"2011-11"`), source `R/functions.R`, run the stages in order and write the headline figures to `outputs/kpis_2011_11.csv`, with the month in the file name.
+
+2.  In the RStudio **Terminal** tab, run `Rscript run_all.R 2011-10` and then `Rscript run_all.R 2011-11`. Confirm that both CSV files have been created.
+
+3.  Using `R/functions.R`, complete the table below by recording the input and output of each stage. Identify the one stage that has a side effect.
+
+    | Stage | Function | Input | Output |
+    |------------------|------------------|------------------|------------------|
+    | Get | `read_extract()` | Monthly CSV file path | Raw sales data |
+    | Check | `validate_extract()` | Raw sales data | Validated sales data |
+    | Prepare | `clean_sales()` | Validated sales data | Cleaned sales data containing completed product sales |
+    | Analyse | `summarise_month()`, `top_by()` | Cleaned sales data and month | Monthly KPIs, top five products and top five countries |
+    | Publish | `publish_report()` | Rendered report file path(s) and month | Published HTML report file path |
+
+**Discussion:** (a) If only `summarise_month()` were changed, how much of the work would `run_all.R` repeat, and why does this matter for a pipeline that takes an hour to run? (b) Is the pipeline in this lab a data pipeline or an analytics pipeline? Identify the likely source of the monthly extract and the type of pipeline that would produce it in an organisation.
+
+**Your answer:**
+
+**(a)** The whole script would run again, including reading, checking and cleaning the data, even though only the summary function changed. This wastes time. If the pipeline takes an hour, it would be better to only rerun the part that has changed.
+
+**(b)** This is an analytics pipeline because it cleans and analyses sales data to produce useful business information. The monthly extract likely comes from a retail sales database or point-of-sale system. In an organisation, a data pipeline would collect and prepare the sales data before providing it for analysis.
+
+<details>
+
+<summary>Hint for Exercise 1</summary>
+
+Read the extract with `read_extract(extract_path(month))` and pass each result to the next function. The expression `paste0("kpis_", sub("-", "_", month), ".csv")` constructs the file name, and `dir.create("outputs", showWarnings = FALSE)` ensures that the folder exists.
+
+</details>
+
+## Part 1. The Pipeline as a Dependency Graph (outcomes 2–3)
+
+A **dependency graph** records which steps depend on which inputs. A pipeline tool compares each step with its inputs and re-executes only the steps that are out of date. In R, this tool is the `targets` package. The file `_targets.R` lists the steps as `tar_target(name, command)`, and one step depends on another when its command refers to that step's name.
+
+```{r example-targets, eval = FALSE}
+# Start of _targets.R: complete it in Exercise 2
+library(targets)
+library(tarchetypes)
+
+# Packages loaded before each step runs
+tar_option_set(packages = c("tidyverse", "pointblank"))
+
+# Load every function in R/
+tar_source()
+
+# The month to process: the PIPELINE_MONTH environment variable, or a default
+month <- Sys.getenv("PIPELINE_MONTH", unset = "2011-11")
+
+list(
+  # A file target: the step reruns if the file's contents change
+  tar_target(raw_file, extract_path(month), format = "file"),
+  tar_target(raw, read_extract(raw_file))
+  # ... add the remaining steps here
+)
+```
+
+The function `tar_make()` always runs `_targets.R` from the project folder in a new R session. Paths in the pipeline are therefore relative to the project folder, and no object from the Console session is used. The report is itself a step. It is rendered by `tar_quarto()`, and the `tar_read()` calls within the report define the steps on which it depends. Because the report reads the stored results of the pipeline, `tar_make()` must be run at least once before the report can be rendered with the Render button.
+
+### Exercise 2 - Pipeline construction
+
+1.  Create `_targets.R` from the example above. Add the steps `validated`, `sales`, `kpis`, `top_products` (by `Description`) and `top_countries` (by `Country`), followed by these two steps:
+    - `tar_quarto(report, "reports/monthly_report.qmd", execute_params = list(month = month))`
+    - `tar_target(published, publish_report(report, month), format = "file")`
+2.  In the `exercise-2` cell, run `tar_manifest()` to list the steps and `tar_visnetwork()` to draw the graph, and then run `tar_make()`.
+3.  Open `outputs/report_2011_11.html` and confirm that the revenue it reports agrees with `outputs/kpis_2011_11.csv` from Part 0.
+
+**Discussion:** Why is the raw file declared with `format = "file"`, and what change would `targets` fail to detect if the file were declared as a plain text path?
+
+```{r exercise-2}
+tar_manifest()
+tar_visnetwork()
+tar_make()
+```
+
+**Your answer:**
+
+The raw file is declared with `format = "file"` so that targets knows it is a file dependency and checks whether the file has changed. This means that if the contents of the CSV file are modified, targets will detect the change and rerun the necessary steps of the pipeline.
+
+If the file were declared as a plain text path, targets would only track the path as a character value. It would not detect changes to the actual contents of the CSV file if the file name and path remained the same.
+
+<details>
+
+<summary>Hint for Exercise 2</summary>
+
+The command of each step uses the name of the previous step, for example `tar_target(sales, clean_sales(validated))`. The function `tar_read(kpis)` displays a stored result in the Console. If `tar_make()` fails, `tar_meta(fields = error, complete_only = TRUE)` reports which step failed and the reason.
+
+</details>
+
+## Part 2. Predicting Re-execution (outcomes 2–3)
+
+The function `tar_outdated()` lists the steps that would run if `tar_make()` were called. Comparing a prediction with this list tests understanding of the dependency graph.
+
+### Exercise 3 - Prediction and verification
+
+For each change below, record a prediction under *Your answer* before running `tar_outdated()`, and then run `tar_make()`.
+
+1.  With no change, run `tar_make()` a second time and confirm with `tar_read(kpis)` that the figures are identical. This property is **idempotence**.
+2.  In `clean_sales()`, remove exactly repeated rows by adding `distinct() |>` before `mutate()`.
+3.  To process October, run `Sys.setenv(PIPELINE_MONTH = "2011-10")`, followed by `tar_outdated()` and `tar_make()`. Then run `Sys.unsetenv("PIPELINE_MONTH")`.
+
+**Discussion:** Change 2 reduces the revenue figure. Is this a correction or an error, and what information about the source data would be required to decide? Record the decision.
+
+```{r exercise-3}
+tar_make()
+tar_read(kpis)
+```
+
+```{r}
+#Removing duplicate rows
+tar_outdated()
+tar_make()
+tar_read(kpis)
+```
+
+```{r}
+Sys.setenv(PIPELINE_MONTH = "2011-10")
+
+tar_outdated()
+tar_make()
+tar_read(kpis)
+
+
+Sys.unsetenv("PIPELINE_MONTH")
+```
+
+**Your answer:**
+
+Prediction 1: I predict that no targets will need to be rerun because none of the files, functions or dependencies have changed. The pipeline should return the same KPI figures as before.
+
+2- After adding distinct() to clean_sales(), the revenue decreased from 1,457,742 to 1,452,113, a reduction of 5,629. The number of orders and customers remained unchanged. This suggests that some repeated rows contributed to the original revenue figure.
+
+Discussion answer: The reduction in revenue could be a correction if the repeated rows were accidental duplicates. However, they could also represent legitimate transactions. We would need to check the original source data, including invoice numbers, transaction IDs and timestamps, to determine whether the rows were genuinely duplicated.
+
+\<detai`ls>`{=html}
+
+<summary>Hint for Exercise 3</summary>
+
+A step is out of date if its command, a function it uses, or any step upstream of it has changed. The progress messages from `tar_make()` identify the steps that were skipped. Lab 03 retained repeated rows, so compare the two revenue figures with `tar_read(kpis)`.
+
+</details>
+
+## Part 3. A Validation Stage (outcome 4)
+
+Cleaning corrects known problems. **Validation** checks that a delivery still satisfies the assumptions on which the code relies, and it stops the pipeline before an incorrect figure reaches the report. As with the data contracts in Week 5, a rule may be **non-blocking**, in which case the problem is recorded and the run continues, or **blocking**, in which case the run halts. In `pointblank`, these correspond to the **warn** and **stop** levels of a rule. Each rule is a function applied to the data, and it returns the data when the rule is satisfied, so rules can be chained:
+
+```{r example-rule}
+# Read the clean November extract
+raw <- read_extract("data/raw/retail_2011_11.csv")
+
+# Completeness rule: guest checkouts have no customer ID, but not this many.
+# warn_at and stop_at below 1 are fractions of rows; 1 or more are counts
+raw |>
+  pointblank::col_vals_not_null(
+    columns = `Customer ID`,
+    actions = pointblank::action_levels(warn_at = 0.30, stop_at = 0.50)
+  ) |>
+  nrow()
+```
+
+The files in `data/incoming/` are three faulty versions of the November extract. Each contains one fault of a kind that a supplier could plausibly introduce.
+
+### Exercise 4 - Validation stage
+
+1.  In `R/functions.R`, rewrite `validate_extract()` as a chain of five rules, using the following levels as a starting point:
+
+    | Rule | `pointblank` function | Non-blocking (warn) | Blocking (stop) |
+    |------------------|------------------|------------------|------------------|
+    | All eight columns present | `col_exists()` |  | any failure (`stop_on_fail()`) |
+    | No negative prices, except bad-debt adjustments (invoices starting "A") | `col_vals_gte()` | 1 line | 1% of lines |
+    | Positive quantities, except cancellations (invoices starting "C") | `col_vals_gt()` | 1% | 5% |
+    | Customer ID present | `col_vals_not_null()` | 30% | 50% |
+    | No repeated rows | `rows_distinct()` | 5% | 20% |
+
+2.  In the `exercise-4` cell, source the file and run `validate_extract()` on the clean November extract, which should pass, possibly with warnings. Then run it on each file in `data/incoming/` within `try(..., silent = TRUE)`, and record the rule that stopped each file.
+
+3.  Test the complete pipeline on a faulty delivery. In `_targets.R`, define `raw_path <- Sys.getenv("PIPELINE_FILE", unset = extract_path(month))` below `month`, and use `raw_path` in place of `extract_path(month)` in the `raw_file` step. Run `Sys.setenv(PIPELINE_FILE = "data/incoming/bad_prices_2011_11.csv")` and `tar_make()`, read the error with `tar_meta(fields = error, complete_only = TRUE)` and examine the contents of `outputs/`. Finally, run `Sys.unsetenv("PIPELINE_FILE")` and `tar_make()`.
+
+**Decision record:** For each rule, state in one sentence why it is non-blocking or blocking at the chosen level, and state whether any level should be changed for the real data.
+
+**Discussion:** After the failed run, `outputs/report_2011_11.html` still exists. Is this report correct, and should it be distributed to the people who use it? Who should be notified of the failure, and by what means?
+
+```{r exercise-4}
+library(pointblank)
+source("R/functions.R")
+raw_nov <- read_extract(extract_path("2011-11"))
+clean_result <- validate_extract(raw_nov)
+clean_result
+```
+
+```{r}
+#retrieving faulty CSV files
+bad_files <- list.files(
+  "data/incoming",
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+#Testing each faulty file
+for (file in bad_files) {
+  cat("\nTesting:", basename(file), "\n")
+  result <- try(
+    validate_extract(read_extract(file)),
+    silent = TRUE
+  )
+  if (inherits(result, "try-error")) {
+    print(result)
+  } else {
+    print("Validation completed without a blocking error")
+  }
+}
+```
+
+```{r}
+Sys.setenv(PIPELINE_FILE = "data/incoming/bad_prices_2011_11.csv") 
+tar_make()
+
+tar_meta(fields = error, complete_only = TRUE)
+```
+
+```{r}
+Sys.unsetenv("PIPELINE_FILE")
+tar_make()
+```
+
+**Decision record:**
+
+1.  **All eight columns present:** This rule is blocking because all required columns are essential for the pipeline to work correctly. I would keep this rule blocking because missing columns could prevent accurate analysis.
+
+2.  **No negative prices:** This rule warns when there is one invalid row and stops when 1% of rows fail because negative prices can affect revenue calculations. I would keep the threshold but investigate any negative prices in the real data.
+
+3.  **Positive quantities:** This rule warns when 1% of rows fail and stops when 5% fail because invalid quantities can affect sales figures. I would keep these levels but review unusual transactions before changing them.
+
+4.  **Customer ID present:** This rule warns when 30% of customer IDs are missing and stops when 50% are missing because customer information is important for customer analysis. I would review the thresholds against real business requirements.
+
+5.  **No repeated rows:** This rule warns when 5% of rows are repeated and stops when 20% are repeated because duplicates can inflate sales figures. I would investigate repeated transactions before deciding whether the thresholds should change.
+
+**Your answer:**
+
+The existing report_2011_11.html is an older report from the previous successful pipeline run. It is not necessarily correct for the latest delivery because the new pipeline failed validation. It should not be distributed as the latest report.
+
+The report should be marked as an older version until the pipeline runs successfully again. The data engineering team, the person responsible for the source data and the report users should be notified by email or the organisation's incident reporting system. They should be informed about the failed validation rule and the faulty file.
+
+<details>
+
+<summary>Hint for Exercise 4</summary>
+
+Supply a character vector of column names to `col_exists(columns = c("Invoice", ...))`. Lines can be excluded from a rule with `preconditions = \(x) filter(x, !startsWith(Invoice, "A"))`. When no columns are named, `rows_distinct()` checks all columns. The function `tar_meta(fields = warnings, complete_only = TRUE)` lists the warnings from the most recent run.
+
+</details>
+
+## Part 4. Scheduled Execution (outcome 5)
+
+A **schedule** runs a pipeline at fixed times. Cron expresses a schedule in five fields (minute, hour, day of month, month and day of week), so `0 6 2 * *` denotes 06:00 on the second day of each month. GitHub Actions reads a workflow file in `.github/workflows/`, starts a new Linux machine at the scheduled times, installs the software the pipeline requires and runs the pipeline. Scheduled times are expressed in UTC, and runs may start late when the service is under load. If notifications are enabled, GitHub notifies the user who created the workflow, or who last changed its schedule, when a scheduled run fails.
+
+GitHub uses the term *workflow* for a configuration file that automates steps. In this module, the analytics workflow is the analytical process that such a file executes. Because the machine starts without any installed packages, it installs the package versions recorded by `renv` (Lab 08) before running `tar_make()`. The `push` trigger runs the workflow after every push, so each change is tested on a machine on which nothing has previously been installed. This is a stricter form of the partner test in Lab 08.
+
+```{verbatim, lang = "yaml"}
+# .github/workflows/pipeline.yml
+name: monthly-pipeline
+on:
+  push:                           # every push: a clean-machine test
+  schedule:
+    - cron: "0 6 2 * *"          # 06:00 UTC on the 2nd of every month
+  workflow_dispatch:              # adds a "Run workflow" button
+    inputs:
+      month:
+        description: "Month to process (YYYY-MM)"
+        default: "2011-11"
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    env:
+      PIPELINE_MONTH: ${{ inputs.month || '2011-11' }}
+    steps:
+      - uses: actions/checkout@v4                 # copy the repository
+      - uses: r-lib/actions/setup-r@v2            # install R
+        with:
+          use-public-rspm: true                   # pre-built packages
+      - uses: r-lib/actions/setup-renv@v2         # packages from renv.lock
+      - uses: quarto-dev/quarto-actions/setup@v2  # Quarto, for the report
+      - name: Run the pipeline
+        run: Rscript -e "targets::tar_make()"
+      - uses: actions/upload-artifact@v4          # keep the outputs
+        if: always()
+        with:
+          name: pipeline-outputs
+          path: outputs/
+```
+
+### Exercise 5 - Scheduled execution with GitHub Actions
+
+Carry out the following steps in the **Console** rather than in the notebook, because several of them require interactive responses.
+
+1.  Place the project under version control and publish it to GitHub with `usethis::use_git()` followed by `usethis::use_github()`. If no GitHub token has been set up, first run `usethis::create_github_token()` and `gitcreds::gitcreds_set()`.
+2.  Run `renv::init()`. This records the packages the project uses in `renv.lock` and restarts R. Run it after step 1, because `renv` gives the project its own package library, which does not contain setup tools such as `usethis`.
+3.  Create `.github/workflows/pipeline.yml` with the contents shown above. Commit it together with `renv.lock`, `.Rprofile` and the `renv/` folder, and push, using the RStudio **Git** pane.
+4.  The push starts the first run, which can be followed on the **Actions** tab. The first run takes several minutes because the packages must be installed. A run can also be started manually through **Actions → monthly-pipeline → Run workflow**. When the run is complete, download **pipeline-outputs** and open the report.
+5.  Change the schedule to 05:30 on the third day of each month, then commit and push the change.
+
+If GitHub is unavailable, the same command can be scheduled locally, using `taskscheduleR` on Windows or a cron entry such as `0 6 2 * * cd /path/to/lab09-pipeline && Rscript -e 'targets::tar_make()'` on macOS and Linux.
+
+**Discussion:** Every scheduled run succeeds and processes November 2011. Explain why. What should an operational pipeline compute instead, and what new form of silent failure would that introduce?
+
+**Your answer:**
+
+<details>
+
+<summary>Hint for Exercise 5</summary>
+
+The files in `data/raw/` must be committed, because the runner has no other source of data. The `_targets/` folder is excluded by `.gitignore` because the runner rebuilds it. If a run fails, open it on the Actions tab and expand the failed step. An operational pipeline would derive the previous month from `Sys.Date()`.
+
+</details>
+
+## Completion and Submission
+
+Restart R, run this notebook from the beginning and then run `tar_make()` once more. Push the final version of the project to GitHub. Submit the repository link, the completed `lab09.Rmd` including the decision record, and the link to one successful run on the Actions tab. Portfolio Entry 3 extends this pipeline with a failure alert and a run log.
+
+**Reading:** GitHub Docs, *Understanding GitHub Actions* (docs.github.com/en/actions). Landau, W. M. *The targets R Package User Manual* (books.ropensci.org/targets). Iannone, R. *pointblank* introduction (rstudio.github.io/pointblank). Timbers, T. et al. *Reproducible and Trustworthy Workflows for Data Science*, "Data analysis pipelines". Data: Chen, D. (2019) Online Retail II, UCI Machine Learning Repository.

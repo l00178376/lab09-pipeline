@@ -1,0 +1,12 @@
+# R session files
+.Rproj.user/
+.Rhistory
+.RData
+# The targets data store is rebuilt by tar_make(); do not commit it
+_targets/
+# Rendered report inside reports/ (the published copy is in outputs/)
+reports/*.html
+.Rproj.user
+.httr-oauth
+.DS_Store
+.quarto
